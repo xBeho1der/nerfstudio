@@ -76,6 +76,11 @@ def get_depth_image_from_path(
     Returns:
         Depth image torch tensor with shape [width, height, 1].
     """
+    
+    # resolve the filepath
+    if not isinstance(filepath, Path):
+        filepath = Path(filepath)
+        
     if filepath.suffix == ".npy":
         image = np.load(filepath) * scale_factor
         image = cv2.resize(image, (width, height), interpolation=interpolation)
