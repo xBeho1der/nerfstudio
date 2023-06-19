@@ -15,7 +15,6 @@
 """Helper utils for processing data into the nerfstudio format."""
 
 import math
-import os
 import shutil
 import sys
 from enum import Enum
@@ -195,7 +194,9 @@ def copy_images_list(
 
     # Remove original directory only if we provide a proper image folder path
     if image_dir.is_dir() and len(image_paths):
-        shutil.rmtree(image_dir, ignore_errors=True)
+        # check that output directory is not the same as input directory
+        if image_dir != image_paths[0].parent:
+            shutil.rmtree(image_dir, ignore_errors=True)
         image_dir.mkdir(exist_ok=True, parents=True)
 
     copied_image_paths = []
@@ -205,7 +206,10 @@ def copy_images_list(
         if verbose:
             CONSOLE.log(f"Copying image {idx + 1} of {len(image_paths)}...")
         copied_image_path = image_dir / f"frame_{idx + 1:05d}{image_path.suffix}"
-        shutil.copy(image_path, copied_image_path)
+        try:
+            shutil.copy(image_path, copied_image_path)
+        except shutil.SameFileError:
+            pass
         copied_image_paths.append(copied_image_path)
 
     if crop_border_pixels is not None:
@@ -343,11 +347,8 @@ def downscale_images(
             assert isinstance(downscale_factor, int)
             downscale_dir = image_dir.parent / f"{folder_name}_{downscale_factor}"
             downscale_dir.mkdir(parents=True, exist_ok=True)
-            # Using %05d ffmpeg commands appears to be unreliable (skips images), so use scandir.
-            files = os.scandir(image_dir)
-            for f in files:
-                if f.is_dir():
-                    continue
+            # Using %05d ffmpeg commands appears to be unreliable (skips images).
+            for f in list_images(image_dir):
                 filename = f.name
                 nn_flag = "" if not nearest_neighbor else ":flags=neighbor"
                 ffmpeg_cmd = [
@@ -395,7 +396,7 @@ def find_tool_feature_matcher_combination(
             "sosnet",
             "disk",
         ],
-        Literal["superglue", "superglue-fast", "NN-superpoint", "NN-ratio", "NN-mutual", "adalam"],
+        Literal["NN", "superglue", "superglue-fast", "NN-superpoint", "NN-ratio", "NN-mutual", "adalam"],
     ],
 ]:
     """Find a valid combination of sfm tool, feature type, and matcher type.
@@ -452,7 +453,7 @@ def generate_circle_mask(height: int, width: int, percent_radius) -> Optional[np
     mask = np.zeros((height, width), dtype=np.uint8)
     center = (width // 2, height // 2)
     radius = int(percent_radius * np.sqrt(width**2 + height**2) / 2.0)
-    cv2.circle(mask, center, radius, 1, -1)  # type: ignore
+    cv2.circle(mask, center, radius, 1, -1)
     return mask
 
 
@@ -523,7 +524,7 @@ def save_mask(
         The path to the mask file or None if no mask is needed.
     """
     image_path = next(image_dir.glob("frame_*"))
-    image = cv2.imread(str(image_path))  # type: ignore
+    image = cv2.imread(str(image_path))
     height, width = image.shape[:2]
     mask = generate_mask(height, width, crop_factor, percent_radius)
     if mask is None:
@@ -531,17 +532,17 @@ def save_mask(
     mask *= 255
     mask_path = image_dir.parent / "masks"
     mask_path.mkdir(exist_ok=True)
-    cv2.imwrite(str(mask_path / "mask.png"), mask)  # type: ignore
+    cv2.imwrite(str(mask_path / "mask.png"), mask)
     downscale_factors = [2**i for i in range(num_downscales + 1)[1:]]
     for downscale in downscale_factors:
         mask_path_i = image_dir.parent / f"masks_{downscale}"
         mask_path_i.mkdir(exist_ok=True)
         mask_path_i = mask_path_i / "mask.png"
-        mask_i = cv2.resize(  # type: ignore
+        mask_i = cv2.resize(
             mask,
             (width // downscale, height // downscale),
-            interpolation=cv2.INTER_NEAREST,  # type: ignore
+            interpolation=cv2.INTER_NEAREST,
         )
-        cv2.imwrite(str(mask_path_i), mask_i)  # type: ignore
+        cv2.imwrite(str(mask_path_i), mask_i)
     CONSOLE.log(":tada: Generated and saved masks.")
     return mask_path / "mask.png"

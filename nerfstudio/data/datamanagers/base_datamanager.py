@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 from abc import abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -33,12 +34,12 @@ from typing import (
     Tuple,
     Type,
     Union,
+    cast,
 )
 
 import torch
 from torch import nn
 from torch.nn import Parameter
-from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 from typing_extensions import TypeVar
 
@@ -75,18 +76,24 @@ def variable_res_collate(batch: List[Dict]) -> Dict:
         Collated batch.
     """
     images = []
-    masks = []
+    imgdata_lists = defaultdict(list)
     for data in batch:
         image = data.pop("image")
-        mask = data.pop("mask", None)
         images.append(image)
-        if mask is not None:
-            masks.append(mask)
+        topop = []
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                # if the value has same height and width as the image, assume that it should be collated accordingly.
+                if len(val.shape) >= 2 and val.shape[:2] == image.shape[:2]:
+                    imgdata_lists[key].append(val)
+                    topop.append(key)
+        # now that iteration is complete, the image data items can be removed from the batch
+        for key in topop:
+            del data[key]
 
     new_batch = nerfstudio_collate(batch)
     new_batch["image"] = images
-    if masks:
-        new_batch["mask"] = masks
+    new_batch.update(imgdata_lists)
 
     return new_batch
 
@@ -154,8 +161,8 @@ class DataManager(nn.Module):
 
     """
 
-    train_dataset: Optional[Dataset] = None
-    eval_dataset: Optional[Dataset] = None
+    train_dataset: Optional[InputDataset] = None
+    eval_dataset: Optional[InputDataset] = None
     train_sampler: Optional[DistributedSampler] = None
     eval_sampler: Optional[DistributedSampler] = None
     includes_time: bool = False
@@ -240,7 +247,7 @@ class DataManager(nn.Module):
             step: the step number of the eval image to retrieve
         Returns:
             A tuple of the ray bundle for the image, and a dictionary of additional batch information
-            such as the groudtruth image.
+            such as the groundtruth image.
         """
         raise NotImplementedError
 
@@ -252,19 +259,19 @@ class DataManager(nn.Module):
             step: the step number of the eval image to retrieve
         Returns:
             A tuple of the ray bundle for the image, and a dictionary of additional batch information
-            such as the groudtruth image.
+            such as the groundtruth image.
         """
         raise NotImplementedError
 
     @abstractmethod
     def next_eval_image(self, step: int) -> Tuple[int, RayBundle, Dict]:
-        """Retreive the next eval image.
+        """Retrieve the next eval image.
 
         Args:
             step: the step number of the eval image to retrieve
         Returns:
             A tuple of the step number, the ray bundle for the image, and a dictionary of
-            additional batch information such as the groudtruth image.
+            additional batch information such as the groundtruth image.
         """
         raise NotImplementedError
 
@@ -278,9 +285,9 @@ class DataManager(nn.Module):
         """Returns the number of rays per batch for evaluation."""
         raise NotImplementedError
 
-    def get_datapath(self) -> Optional[Path]:
+    @abstractmethod
+    def get_datapath(self) -> Path:
         """Returns the path to the data. This is used to determine where to save camera paths."""
-        return None
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -325,7 +332,7 @@ class VanillaDataManagerConfig(DataManagerConfig):
     camera_optimizer: CameraOptimizerConfig = CameraOptimizerConfig()
     """Specifies the camera pose optimizer used during training. Helpful if poses are noisy, such as for data from
     Record3D."""
-    collate_fn: Callable[[Any], Any] = staticmethod(nerfstudio_collate)
+    collate_fn: Callable[[Any], Any] = cast(Any, staticmethod(nerfstudio_collate))
     """Specifies the collate function to use for the train and eval dataloaders."""
     camera_res_scale_factor: float = 1.0
     """The scale factor for scaling spatial data such as images, mask, semantics
@@ -381,11 +388,14 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         else:
             self.config.data = self.config.dataparser.data
         self.dataparser = self.dataparser_config.setup()
+        if test_mode == "inference":
+            self.dataparser.downscale_factor = 1  # Avoid opening images
         self.includes_time = self.dataparser.includes_time
-        self.train_dataparser_outputs = self.dataparser.get_dataparser_outputs(split="train")
+        self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
 
         self.train_dataset = self.create_train_dataset()
         self.eval_dataset = self.create_eval_dataset()
+        self.exclude_batch_keys_from_device = self.train_dataset.exclude_batch_keys_from_device
 
         if self.train_dataparser_outputs is not None:
             cameras = self.train_dataparser_outputs.cameras
@@ -445,6 +455,7 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
             num_workers=self.world_size * 4,
             pin_memory=True,
             collate_fn=self.config.collate_fn,
+            exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
         )
         self.iter_train_image_dataloader = iter(self.train_image_dataloader)
         self.train_pixel_sampler = self._get_pixel_sampler(self.train_dataset, self.config.train_num_rays_per_batch)
@@ -468,6 +479,7 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
             num_workers=self.world_size * 4,
             pin_memory=True,
             collate_fn=self.config.collate_fn,
+            exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
         )
         self.iter_eval_image_dataloader = iter(self.eval_image_dataloader)
         self.eval_pixel_sampler = self._get_pixel_sampler(self.eval_dataset, self.config.eval_num_rays_per_batch)
